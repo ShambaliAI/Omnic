@@ -15,3 +15,9 @@
 
 - Keep schema management in feature-level setup functions so each feature owns its required tables.
 - Avoid deferred runtime failures: schema checks and migrations should run before handlers start serving traffic.
+
+## Command Menu Sync Rule
+
+- Whenever bot commands are added, removed, or updated, `_setup_command_menu` must be updated in the same change.
+- Keep command handlers and Telegram shortcut menu entries consistent to avoid missing `/` menu actions.
+- Command updates must cover the relevant Telegram scopes (at least `default`, `all_private_chats`, `all_group_chats`, and `all_chat_administrators` when group usage matters), so group chat shortcut menus can refresh correctly.

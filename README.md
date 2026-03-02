@@ -4,6 +4,7 @@ This is the smallest usable verification version:
 
 - `/start` returns a fixed message to confirm the bot is online.
 - Regular text messages are persisted into SQLite for summary.
+- `/gpt <question>` asks GPT and includes reply/quote context when present.
 
 ## Run
 
@@ -41,6 +42,7 @@ Send the following messages to your bot in Telegram:
 7. `/summary end`
 8. `/summary end focus on action items only`
 9. `/summary usage`
+10. `/gpt 这段讨论的决策是什么？` (optionally use reply/quote)
 
 Expected behavior:
 
@@ -52,3 +54,4 @@ Expected behavior:
 - `/summary end` summarizes messages since that user's start position and clears it.
 - `/summary end [prompt]` supports extra customization prompt on top of default system prompt.
 - `/summary usage` shows used and remaining context count for the current user's start point.
+- `/gpt <question>` returns a GPT answer, and passes reply/quote as additional context when available.

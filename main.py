@@ -8,9 +8,11 @@ from urllib import request, error
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
+    BotCommandScopeAllChatAdministrators,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeDefault,
+    Message,
     Update,
 )
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -82,7 +84,62 @@ def _build_summary_prompt(messages: list[tuple[int, int | None, str | None, str]
     return "\n".join(lines)
 
 
-def _call_openai_chat(prompt: str, bot_data: dict, extra_system_prompt: str | None = None) -> str:
+def _build_gpt_prompt(question: str, reply_context: str | None, quote_context: str | None) -> str:
+    sections = [f"Question:\n{question.strip()}"]
+    if reply_context:
+        sections.append(f"Reply context:\n{reply_context}")
+    if quote_context:
+        sections.append(f"Quote context:\n{quote_context}")
+    return "\n\n".join(sections)
+
+
+def _extract_message_text(message: Message | None) -> str | None:
+    if message is None:
+        return None
+    text = message.text or message.caption
+    if text is None:
+        return None
+    normalized = str(text).strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _extract_reply_context(message: Message) -> str | None:
+    reply_message = message.reply_to_message
+    reply_text = _extract_message_text(reply_message)
+    if reply_text is None:
+        return None
+
+    display_name = "unknown_user"
+    if reply_message is not None and reply_message.from_user is not None:
+        display_name = (
+            reply_message.from_user.username
+            or reply_message.from_user.full_name
+            or "unknown_user"
+        )
+    return f"{display_name}: {reply_text}"
+
+
+def _extract_quote_context(message: Message) -> str | None:
+    quote = getattr(message, "quote", None)
+    if quote is None:
+        return None
+    quote_text = getattr(quote, "text", None)
+    if quote_text is None:
+        return None
+    normalized = str(quote_text).strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _call_openai_chat(
+    prompt: str,
+    bot_data: dict,
+    extra_system_prompt: str | None = None,
+    mode: str = "summary",
+) -> str:
     api_key = bot_data.get("openai_api_key")
     api_base = bot_data.get("openai_base_url", "https://api.openai.com/v1")
     model = bot_data.get("openai_chat_model", "gpt-4.1-mini")
@@ -91,16 +148,21 @@ def _call_openai_chat(prompt: str, bot_data: dict, extra_system_prompt: str | No
         raise RuntimeError("OPENAI_API_KEY is missing. Please set it in .env")
 
     url = f"{api_base.rstrip('/')}/chat/completions"
-    messages_payload: list[dict[str, str]] = [
-        {
-            "role": "system",
-            "content": (
-                "You are a chat summarizer for a Telegram group. "
-                "Return a short, natural Chinese summary in plain paragraphs. "
-                "Avoid rigid sections or bullet templates."
-            ),
-        }
-    ]
+    if mode == "summary":
+        system_content = (
+            "You are a chat summarizer for a Telegram group. "
+            "Return a short, natural Chinese summary in plain paragraphs. "
+            "Avoid rigid sections or bullet templates."
+        )
+    elif mode == "assistant":
+        system_content = (
+            "You are a helpful assistant for a Telegram group. "
+            "Use provided context when available and answer accurately in concise Chinese."
+        )
+    else:
+        raise RuntimeError(f"Unsupported OpenAI chat mode: {mode}")
+
+    messages_payload: list[dict[str, str]] = [{"role": "system", "content": system_content}]
     if extra_system_prompt:
         messages_payload.append(
             {
@@ -182,10 +244,12 @@ async def _setup_command_menu(application: Application) -> None:
     commands = [
         BotCommand("start", "Check bot status"),
         BotCommand("summary", "Usage: /summary <count> [prompt]|start|end [prompt]|usage"),
+        BotCommand("gpt", "Usage: /gpt <question>"),
     ]
     await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
     await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
     await application.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+    await application.bot.set_my_commands(commands, scope=BotCommandScopeAllChatAdministrators())
 
 
 async def _summarize_messages(
@@ -389,6 +453,37 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def gpt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    question = " ".join(context.args).strip()
+    reply_context = _extract_reply_context(update.message)
+    quote_context = _extract_quote_context(update.message)
+
+    if not question:
+        if reply_context is None and quote_context is None:
+            await _reply_text(update, "用法：/gpt <问题>（可结合 reply/quote）")
+            return
+        question = "请基于上下文回答这个问题。"
+
+    prompt = _build_gpt_prompt(question, reply_context, quote_context)
+    try:
+        answer = await asyncio.to_thread(
+            _call_openai_chat,
+            prompt,
+            context.application.bot_data,
+            None,
+            "assistant",
+        )
+    except Exception as exc:
+        logger.exception("Failed to answer gpt request: %s", exc)
+        await _reply_text(update, f"GPT 回答失败：{exc}")
+        return
+
+    await _reply_text(update, answer)
+
+
 async def _maybe_auto_finalize_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -492,6 +587,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("summary", summary))
+    app.add_handler(CommandHandler("gpt", gpt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
     try:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
