@@ -30,6 +30,7 @@ MESSAGE_EVENTS_TABLE = TableSpec(
         ColumnSpec("id", "INTEGER", primary_key=True),
         ColumnSpec("chat_id", "INTEGER", not_null=True),
         ColumnSpec("user_id", "INTEGER"),
+        ColumnSpec("user_name", "TEXT"),
         ColumnSpec("message_text", "TEXT", not_null=True),
         ColumnSpec("created_at", "TEXT", not_null=True, default_value="CURRENT_TIMESTAMP"),
     ),
@@ -38,8 +39,30 @@ CREATE TABLE message_events (
     id INTEGER PRIMARY KEY,
     chat_id INTEGER NOT NULL,
     user_id INTEGER,
+    user_name TEXT,
     message_text TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+""".strip(),
+)
+
+SUMMARY_POSITIONS_TABLE = TableSpec(
+    name="summary_positions",
+    columns=(
+        ColumnSpec("id", "INTEGER", primary_key=True),
+        ColumnSpec("chat_id", "INTEGER", not_null=True),
+        ColumnSpec("user_id", "INTEGER", not_null=True),
+        ColumnSpec("start_message_id", "INTEGER", not_null=True),
+        ColumnSpec("created_at", "TEXT", not_null=True, default_value="CURRENT_TIMESTAMP"),
+    ),
+    create_sql="""
+CREATE TABLE summary_positions (
+    id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    start_message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(chat_id, user_id)
 );
 """.strip(),
 )
@@ -78,20 +101,178 @@ def setup_echo_feature(conn: sqlite3.Connection) -> None:
     ensure_table(conn, MESSAGE_EVENTS_TABLE)
 
 
+def setup_summary_feature(conn: sqlite3.Connection) -> None:
+    ensure_table(conn, SUMMARY_POSITIONS_TABLE)
+
+
 def record_message_event(
     conn: sqlite3.Connection,
     chat_id: int | None,
     user_id: int | None,
+    user_name: str | None,
     message_text: str,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO message_events (chat_id, user_id, message_text)
-        VALUES (?, ?, ?);
+        INSERT INTO message_events (chat_id, user_id, user_name, message_text)
+        VALUES (?, ?, ?, ?);
         """,
-        (chat_id, user_id, message_text),
+        (chat_id, user_id, user_name, message_text),
     )
     conn.commit()
+
+
+def get_latest_message_id(conn: sqlite3.Connection, chat_id: int) -> int:
+    row = conn.execute(
+        """
+        SELECT MAX(id)
+        FROM message_events
+        WHERE chat_id = ?;
+        """,
+        (chat_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return 0
+    return int(row[0])
+
+
+def set_summary_start(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+    start_message_id: int,
+) -> bool:
+    cursor = conn.execute(
+        """
+        INSERT INTO summary_positions (chat_id, user_id, start_message_id)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id, user_id) DO NOTHING;
+        """,
+        (chat_id, user_id, start_message_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_summary_start(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+) -> int | None:
+    row = conn.execute(
+        """
+        SELECT start_message_id
+        FROM summary_positions
+        WHERE chat_id = ? AND user_id = ?;
+        """,
+        (chat_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0])
+
+
+def clear_summary_start(conn: sqlite3.Connection, chat_id: int, user_id: int) -> None:
+    conn.execute(
+        """
+        DELETE FROM summary_positions
+        WHERE chat_id = ? AND user_id = ?;
+        """,
+        (chat_id, user_id),
+    )
+    conn.commit()
+
+
+def count_messages_since(conn: sqlite3.Connection, chat_id: int, start_message_id: int) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(1)
+        FROM message_events
+        WHERE chat_id = ? AND id > ?;
+        """,
+        (chat_id, start_message_id),
+    ).fetchone()
+    if row is None:
+        return 0
+    return int(row[0])
+
+
+def fetch_recent_messages(
+    conn: sqlite3.Connection, chat_id: int, limit: int
+) -> list[tuple[int, int | None, str | None, str]]:
+    rows = conn.execute(
+        """
+        SELECT id, user_id, user_name, message_text
+        FROM message_events
+        WHERE chat_id = ?
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (chat_id, limit),
+    ).fetchall()
+    rows.reverse()
+    return [(int(row[0]), row[1], row[2], str(row[3])) for row in rows]
+
+
+def fetch_messages_since(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    start_message_id: int,
+    limit: int | None = None,
+) -> list[tuple[int, int | None, str | None, str]]:
+    sql = """
+        SELECT id, user_id, user_name, message_text
+        FROM message_events
+        WHERE chat_id = ? AND id > ?
+        ORDER BY id ASC
+    """
+    params: list[Any] = [chat_id, start_message_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [(int(row[0]), row[1], row[2], str(row[3])) for row in rows]
+
+
+def get_latest_user_name(conn: sqlite3.Connection, chat_id: int, user_id: int) -> str | None:
+    row = conn.execute(
+        """
+        SELECT user_name
+        FROM message_events
+        WHERE chat_id = ? AND user_id = ? AND user_name IS NOT NULL AND user_name <> ''
+        ORDER BY id DESC
+        LIMIT 1;
+        """,
+        (chat_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def list_group_chat_ids(conn: sqlite3.Connection) -> list[int]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT chat_id
+        FROM message_events
+        WHERE chat_id < 0
+        ORDER BY chat_id;
+        """
+    ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def list_summary_positions_by_chat(conn: sqlite3.Connection, chat_id: int) -> list[tuple[int, int]]:
+    rows = conn.execute(
+        """
+        SELECT user_id, start_message_id
+        FROM summary_positions
+        WHERE chat_id = ?
+        ORDER BY id ASC;
+        """,
+        (chat_id,),
+    ).fetchall()
+    return [(int(row[0]), int(row[1])) for row in rows]
 
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
